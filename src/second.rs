@@ -7,11 +7,20 @@ use mio;
 const DEFAULT_EVENTS_CAPACITY: usize = 1024;
 
 struct TimedEvent {
-    //callback: Box<dyn FnOnce()>,
     callback: Box<dyn FnMut()>,
     register_instant: time::Instant,
     delta_time: time::Duration,
     done: bool,
+}
+
+struct FdEvent {
+    callback: Box<dyn FnMut()>,
+}
+
+enum Event {
+    Timed(TimedEvent),
+    Fd(FdEvent),
+    Exit,
 }
 
 pub struct SpEvents {
@@ -19,20 +28,25 @@ pub struct SpEvents {
     fd_events: mio::event::Events,
     timed_events: vec::Vec<TimedEvent>,
     exit_events: bool,
-    timed_event_tx: mpsc::Sender<TimedEvent>,
-    timed_event_rx: mpsc::Receiver<TimedEvent>,
+    event_tx: mpsc::Sender<Event>,
+    event_rx: mpsc::Receiver<Event>,
 }
 
 #[derive(Clone)]
 pub struct SpEventsHandle {
-    timed_event_tx: mpsc::Sender<TimedEvent>,
+    event_tx: mpsc::Sender<Event>,
 }
 
 impl SpEventsHandle {
     //pub fn e_queue(&mut self, func: impl FnOnce() + 'static, delta_time: time::Duration) -> i32 {
     pub fn e_queue(&self, func: impl FnMut() + 'static, delta_time: time::Duration) -> i32 {
         let event = TimedEvent {callback: Box::new(func), register_instant: time::Instant::now(), delta_time: delta_time, done: false };
-        self.timed_event_tx.send(event).unwrap();
+        self.event_tx.send(Event::Timed(event)).unwrap();
+        0
+    }
+
+    pub fn e_exit_events(&self) -> i32 {
+        self.event_tx.send(Event::Exit).unwrap();
         0
     }
 }
@@ -46,11 +60,11 @@ impl SpEvents {
         let fd_events = mio::Events::with_capacity(DEFAULT_EVENTS_CAPACITY);
         let (tx, rx) = mpsc::channel();
 
-        Ok(SpEvents {poll: poll, fd_events: fd_events, timed_events: vec::Vec::new(), exit_events: false, timed_event_tx: tx, timed_event_rx: rx })
+        Ok(SpEvents {poll: poll, fd_events: fd_events, timed_events: vec::Vec::new(), exit_events: false, event_tx: tx, event_rx: rx })
     }
 
-    fn get_handle(&self) -> SpEventsHandle {
-        SpEventsHandle {timed_event_tx: self.timed_event_tx.clone()}
+    pub fn get_handle(&self) -> SpEventsHandle {
+        SpEventsHandle {event_tx: self.event_tx.clone()}
     }
 
     fn e_queue_internal(&mut self, event: TimedEvent) {
@@ -66,11 +80,16 @@ impl SpEvents {
             }
 
             loop {
-                let new_event = match self.timed_event_rx.try_recv() {
+                let new_event = match self.event_rx.try_recv() {
                     Ok(event) => event,
                     Err(_e) => break
                 };
-                self.e_queue_internal(new_event);
+
+                match new_event {
+                    Event::Timed(event) => self.e_queue_internal(event),
+                    Event::Fd(_) => todo!(),
+                    Event::Exit => self.exit_events = true,
+                }
             }
 
             // Handle timed events
@@ -110,10 +129,6 @@ impl SpEvents {
             }
         }
     }
-
-    pub fn e_exit_events(&mut self) {
-        self.exit_events = true;
-    }
 }
 
 pub fn add(left: usize, right: usize) -> usize {
@@ -124,10 +139,6 @@ pub fn say_hello(events: SpEventsHandle) {
     println!("hello");
     let handle = events.clone();
     events.e_queue(move || { say_hello(handle.clone()); }, time::Duration::from_millis(5000));
-}
-
-pub fn quit(events: &mut SpEvents) {
-    events.e_exit_events();
 }
 
 #[cfg(test)]
@@ -149,7 +160,11 @@ mod tests {
         assert_eq!(result, 0);
 
         let ev_handle2 = my_events.get_handle();
-        let result = ev_handle.e_queue(move || { say_hello(ev_handle2.clone()); }, time::Duration::from_millis(5000));
+        let result = ev_handle.e_queue(move || { ev_handle2.e_exit_events(); }, time::Duration::from_millis(30000));
+        assert_eq!(result, 0);
+
+        let ev_handle3 = my_events.get_handle();
+        let result = ev_handle.e_queue(move || { say_hello(ev_handle3.clone()); }, time::Duration::from_millis(5000));
         assert_eq!(result, 0);
 
         my_events.e_handle_events();
