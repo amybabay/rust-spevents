@@ -16,8 +16,11 @@ struct TimedEvent {
     delta_time: time::Duration,
 }
 
-struct FdEvent {
-    callback: Box<dyn FnMut()>,
+struct FdEvent
+{
+    //callback: Box<dyn FnMut()>,
+    callback: fn(&mio::net::UdpSocket),
+    source: mio::net::UdpSocket,
     token: mio::Token,
 }
 
@@ -56,6 +59,28 @@ impl SpEvents {
         0
     }
 
+    pub fn e_attach_fd(&self, mut source: mio::net::UdpSocket, interest: mio::Interest, func: fn(&mio::net::UdpSocket), priority: Priority) -> io::Result<()>
+    {
+        let mut fd_events = self.fd_events.borrow_mut();
+        let event_count = fd_events.len();
+        if event_count == DEFAULT_EVENTS_CAPACITY {
+            return Err(io::Error::new(io::ErrorKind::Other, "Maximum number of FD events already registered"))
+        }
+
+        let token = mio::Token(event_count);
+        if let Err(err) = self.poll.borrow_mut().registry().register(&mut source, token, interest) {
+            return Err(err)
+        }
+
+        let event = FdEvent {callback: func,
+                             source: source,
+                             token: token};
+
+        fd_events.push(event);
+        Ok(())
+    }
+
+/*
     pub fn e_attach_fd<S>(&self, source: &mut S, interest: mio::Interest, func: impl FnMut() + 'static, priority: Priority) -> io::Result<()>
     where S: mio::event::Source + ?Sized,
     {
@@ -72,7 +97,7 @@ impl SpEvents {
         fd_events.push(event);
         self.poll.borrow_mut().registry().register(source, token, interest)
     }
-
+*/
     pub fn e_exit_events(&self) {
         *self.exit_events.borrow_mut() = true;
     }
@@ -160,7 +185,7 @@ impl SpEvents {
             for event in mio_events.iter() {
                 let event_data = self.get_fd_event_by_token(&mut fd_events, event.token());
                 if let Some(ev) = event_data {
-                    (ev.callback)()
+                    (ev.callback)(&mut ev.source)
                 }
             } // end event iteration
 
@@ -235,11 +260,11 @@ mod tests {
     }
 
     #[test]
-    fn e_fd() {
+    fn e_fd_minimal() {
         let my_events = Rc::new(SpEvents::new().unwrap());
         let mut socket =  mio::net::UdpSocket::bind("127.0.0.1:5555".parse().unwrap()).unwrap();
 
-        my_events.e_attach_fd(&mut socket, mio::Interest::READABLE, || { add(2, 5); }, Priority::HighPriority).unwrap();
+        //my_events.e_attach_fd(&mut socket, mio::Interest::READABLE, || { add(2, 5); }, Priority::HighPriority).unwrap();
         my_events.e_queue(|| { send_msg("this is a test message", "127.0.0.1:5555"); }, time::Duration::from_secs(2));
         my_events.e_queue(|| { send_msg("this is another test message", "127.0.0.1:5555"); }, time::Duration::from_secs(7));
 
@@ -251,4 +276,20 @@ mod tests {
         my_events.e_handle_events();
     }
 
+    #[test]
+    fn e_fd() {
+        let my_events = Rc::new(SpEvents::new().unwrap());
+        let mut socket =  mio::net::UdpSocket::bind("127.0.0.1:6666".parse().unwrap()).unwrap();
+
+        my_events.e_attach_fd(socket, mio::Interest::READABLE, receive_msg, Priority::HighPriority).unwrap();
+        my_events.e_queue(|| { send_msg("++++++ this is a test message", "127.0.0.1:6666"); }, time::Duration::from_secs(2));
+        my_events.e_queue(|| { send_msg("++++++ this is another test message", "127.0.0.1:6666"); }, time::Duration::from_secs(7));
+
+        let ev_clone = my_events.clone();
+        let result = my_events.e_queue(move || { ev_clone.e_exit_events(); }, time::Duration::from_secs(21));
+        assert_eq!(result, 0);
+
+
+        my_events.e_handle_events();
+    }
 }
