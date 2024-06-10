@@ -16,12 +16,28 @@ struct TimedEvent {
     delta_time: time::Duration,
 }
 
-struct FdEvent
+trait AnyFdEvent {
+    fn do_callback(&self);
+    fn get_token(&self) -> mio::Token;
+}
+
+struct FdEvent<S>
+where S: mio::event::Source + ?Sized,
 {
     //callback: Box<dyn FnMut()>,
-    callback: fn(&mio::net::UdpSocket),
-    source: mio::net::UdpSocket,
+    callback: fn(&S),
+    source: Box<S>,
     token: mio::Token,
+}
+
+impl <S: mio::event::Source + ?Sized> AnyFdEvent for FdEvent<S> {
+    fn do_callback(&self) {
+        (self.callback)(&self.source);
+    }
+
+    fn get_token(&self) -> mio::Token {
+        self.token
+    }
 }
 
 pub enum Priority {
@@ -32,7 +48,10 @@ pub enum Priority {
 
 pub struct SpEvents {
     poll: RefCell<mio::Poll>,
-    fd_events: RefCell<vec::Vec<FdEvent>>,
+    // issue with declaring this vector. issue is that it's the FdEvent struct that needs to be
+    // dyn... need to make new trait that FdEvent will implement and have the vector be of that
+    // trait
+    fd_events: RefCell<vec::Vec<Box<dyn AnyFdEvent>>>,
     timed_events: RefCell<vec::Vec<TimedEvent>>,
     exit_events: RefCell<bool>,
 }
@@ -59,7 +78,8 @@ impl SpEvents {
         0
     }
 
-    pub fn e_attach_fd(&self, mut source: mio::net::UdpSocket, interest: mio::Interest, func: fn(&mio::net::UdpSocket), priority: Priority) -> io::Result<()>
+    pub fn e_attach_fd<S>(&self, mut source: S, interest: mio::Interest, func: fn(&S), priority: Priority) -> io::Result<()>
+    where S: mio::event::Source + 'static,
     {
         let mut fd_events = self.fd_events.borrow_mut();
         let event_count = fd_events.len();
@@ -73,10 +93,10 @@ impl SpEvents {
         }
 
         let event = FdEvent {callback: func,
-                             source: source,
+                             source: Box::new(source),
                              token: token};
 
-        fd_events.push(event);
+        fd_events.push(Box::new(event));
         Ok(())
     }
 
@@ -137,10 +157,10 @@ impl SpEvents {
         Some(min_timeout)
     }
 
-    fn get_fd_event_by_token<'a>(&'a self, fd_events: &'a mut vec::Vec::<FdEvent>, token: mio::Token) -> Option<&mut FdEvent> {
+    fn get_fd_event_by_token<'a>(&'a self, fd_events: &'a mut vec::Vec::<Box<dyn AnyFdEvent>>, token: mio::Token) -> Option<&mut dyn AnyFdEvent> {
         for event in fd_events.iter_mut() {
-            if event.token == token {
-                return Some(event)
+            if event.get_token() == token {
+                return Some(&mut **event)
             }
         }
         None
@@ -185,7 +205,7 @@ impl SpEvents {
             for event in mio_events.iter() {
                 let event_data = self.get_fd_event_by_token(&mut fd_events, event.token());
                 if let Some(ev) = event_data {
-                    (ev.callback)(&mut ev.source)
+                    ev.do_callback();
                 }
             } // end event iteration
 
@@ -264,7 +284,7 @@ mod tests {
         let my_events = Rc::new(SpEvents::new().unwrap());
         let mut socket =  mio::net::UdpSocket::bind("127.0.0.1:5555".parse().unwrap()).unwrap();
 
-        //my_events.e_attach_fd(&mut socket, mio::Interest::READABLE, || { add(2, 5); }, Priority::HighPriority).unwrap();
+        my_events.e_attach_fd(socket, mio::Interest::READABLE, |_| { add(2, 5); }, Priority::HighPriority).unwrap();
         my_events.e_queue(|| { send_msg("this is a test message", "127.0.0.1:5555"); }, time::Duration::from_secs(2));
         my_events.e_queue(|| { send_msg("this is another test message", "127.0.0.1:5555"); }, time::Duration::from_secs(7));
 
