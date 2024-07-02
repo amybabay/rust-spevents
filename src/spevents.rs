@@ -11,7 +11,7 @@ const DEFAULT_EVENTS_CAPACITY: usize = 1024;
 const MAX_MSG_SIZE: usize = 1024;
 
 struct TimedEvent {
-    callback: Option<Box<dyn FnOnce()>>, // using option here allows us to invalidate the callback (set to none) to prove we won't call it again, so FnOnce is sufficient
+    callback: fn(&SpEvents),
     register_instant: time::Instant,
     delta_time: time::Duration,
 }
@@ -70,18 +70,18 @@ impl SpEvents {
                     })
     }
 
-    /// Schedules callback function 'func' to be called after time 'delta_time' elapses
-    pub fn e_queue(&self, func: impl FnOnce() + 'static, delta_time: time::Duration) -> i32 {
+    /// Schedules callback function `func` to be called after time `delta_time` elapses
+    pub fn e_queue(&self, func: fn(&SpEvents), delta_time: time::Duration) -> i32 {
         println!("Queueing event: delta time {:?}", delta_time);
-        let event = TimedEvent {callback: Some(Box::new(func)), 
+        let event = TimedEvent {callback: func, 
                                 register_instant: time::Instant::now(),
                                 delta_time: delta_time};
         self.timed_events.borrow_mut().push(event);
         0
     }
 
-    /// Attaches callback function 'func' to mio event source 'source', such that 'func' is called
-    /// each time mio interest 'interest' (e.g. readable, writeable) is ready
+    /// Attaches callback function `func` to mio event source `source`, such that `func` is called
+    /// each time mio interest `interest` (e.g. readable, writeable) is ready
     pub fn e_attach_fd<S>(&self, mut source: S, interest: mio::Interest, func: fn(&S, &SpEvents), priority: Priority) -> io::Result<()>
     where S: mio::event::Source + 'static,
     {
@@ -104,7 +104,7 @@ impl SpEvents {
         Ok(())
     }
 
-    /// Set self.exit_events to true, so that we will exit the event loop on the next iteration
+    /// Set `self.exit_events` to true, so that we will exit the event loop on the next iteration
     pub fn e_exit_events(&self) {
         *self.exit_events.borrow_mut() = true;
     }
@@ -154,8 +154,8 @@ impl SpEvents {
     }
 
     /// Start the event loop. Normally this is called after scheduling some timed events and/or
-    /// attaching some fd events. This will run until e_exit_events is called (if no scheduled /
-    /// attached event ever calls e_exit events, the loop will run forever)
+    /// attaching some fd events. This will run until `e_exit_events` is called (if no scheduled /
+    /// attached event ever calls `e_exit_events`, the loop will run forever)
     pub fn e_handle_events(&self) {
         let mut mio_events = mio::Events::with_capacity(DEFAULT_EVENTS_CAPACITY);
 
@@ -164,9 +164,7 @@ impl SpEvents {
             let mut ready_events = self.get_ready_events();
             for event in ready_events.iter_mut() {
                 println!("Doing event: register_instant.elapsed {:?}, delta time {:?}", event.register_instant.elapsed(), event.delta_time);
-                if let Some(cb) = mem::replace(&mut event.callback, None) {
-                    (cb)();
-                }
+                (event.callback)(&self);
 
                 // Check whether we should exit
                 if *self.exit_events.borrow() {
@@ -211,11 +209,15 @@ pub fn add(left: usize, right: usize) -> usize {
     left + right
 }
 
-pub fn say_hello(events: Rc<SpEvents>) {
+pub fn say_hello(events: &SpEvents) {
     println!("hello");
-    let ev_clone = events.clone();
-    events.e_queue(move || { say_hello(ev_clone); }, time::Duration::from_millis(5000));
+    events.e_queue(say_hello, time::Duration::from_millis(5000));
 }
+
+pub fn exit_events(events: &SpEvents) {
+    events.e_exit_events();
+}
+
 
 pub fn send_msg(msg: &str, addr: &str) {
     let socket = mio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0).into()).unwrap();
@@ -224,7 +226,7 @@ pub fn send_msg(msg: &str, addr: &str) {
     println!("Sent {bytes:?}  bytes: {}", msg);
 }
 
-pub fn receive_msg(socket: &mio::net::UdpSocket) {
+pub fn receive_msg(socket: &mio::net::UdpSocket, _: &SpEvents) {
     let mut buf: [u8; MAX_MSG_SIZE] = [0; MAX_MSG_SIZE];
     match socket.recv_from(&mut buf) {
         Ok((bytes, from_addr)) => {
@@ -257,7 +259,7 @@ pub fn receive_msg2(socket: &mio::net::UdpSocket, events: &SpEvents) {
         }
     }
 
-    events.e_queue(|| { add(7, 8);}, time::Duration::from_secs(1));
+    events.e_queue(|_| { add(7, 8);}, time::Duration::from_secs(1));
 }
 
 #[cfg(test)]
@@ -272,17 +274,15 @@ mod tests {
 
     #[test]
     fn e_timed() {
-        let my_events = Rc::new(SpEvents::new().unwrap());
+        let my_events = SpEvents::new().unwrap();
 
-        let result = my_events.e_queue(|| { add(3, 4); }, time::Duration::from_millis(500));
+        let result = my_events.e_queue(|_| { add(3, 4); }, time::Duration::from_millis(500));
         assert_eq!(result, 0);
 
-        let ev_clone1 = my_events.clone();
-        let result = my_events.e_queue(move || { say_hello(ev_clone1); }, time::Duration::from_millis(5000));
+        let result = my_events.e_queue(say_hello, time::Duration::from_millis(5000));
         assert_eq!(result, 0);
 
-        let ev_clone2 = my_events.clone();
-        let result = my_events.e_queue(move || { ev_clone2.e_exit_events(); }, time::Duration::from_millis(20000));
+        let result = my_events.e_queue(exit_events, time::Duration::from_millis(20000));
         assert_eq!(result, 0);
 
         my_events.e_handle_events();
@@ -290,15 +290,14 @@ mod tests {
 
     #[test]
     fn e_fd_minimal() {
-        let my_events = Rc::new(SpEvents::new().unwrap());
+        let my_events = SpEvents::new().unwrap();
         let socket =  mio::net::UdpSocket::bind("127.0.0.1:5555".parse().unwrap()).unwrap();
 
         my_events.e_attach_fd(socket, mio::Interest::READABLE, |_,_| { add(2, 5); }, Priority::HighPriority).unwrap();
-        my_events.e_queue(|| { send_msg("----- this is a test message", "127.0.0.1:5555"); }, time::Duration::from_secs(2));
-        my_events.e_queue(|| { send_msg("----- this is another test message", "127.0.0.1:5555"); }, time::Duration::from_secs(7));
+        my_events.e_queue(|_| { send_msg("----- this is a test message", "127.0.0.1:5555"); }, time::Duration::from_secs(2));
+        my_events.e_queue(|_| { send_msg("----- this is another test message", "127.0.0.1:5555"); }, time::Duration::from_secs(7));
 
-        let ev_clone = my_events.clone();
-        let result = my_events.e_queue(move || { ev_clone.e_exit_events(); }, time::Duration::from_secs(21));
+        let result = my_events.e_queue(exit_events, time::Duration::from_secs(21));
         assert_eq!(result, 0);
 
 
@@ -307,22 +306,19 @@ mod tests {
 
     #[test]
     fn e_fd() {
-        let my_events = Rc::new(SpEvents::new().unwrap());
-        //let my_events = SpEvents::new().unwrap();
-//        let socket =  mio::net::UdpSocket::bind("127.0.0.1:6666".parse().unwrap()).unwrap();
-//
-//        my_events.e_attach_fd(socket, mio::Interest::READABLE, receive_msg, Priority::HighPriority).unwrap();
-//        my_events.e_queue(|| { send_msg("++++++ this is a test message", "127.0.0.1:6666"); }, time::Duration::from_secs(2));
-//        my_events.e_queue(|| { send_msg("++++++ this is another test message", "127.0.0.1:6666"); }, time::Duration::from_secs(7));
-//
+        let my_events = SpEvents::new().unwrap();
+
+        let socket =  mio::net::UdpSocket::bind("127.0.0.1:6666".parse().unwrap()).unwrap();
+        my_events.e_attach_fd(socket, mio::Interest::READABLE, receive_msg, Priority::HighPriority).unwrap();
+        my_events.e_queue(|_| { send_msg("++++++ this is a test message", "127.0.0.1:6666"); }, time::Duration::from_secs(2));
+        my_events.e_queue(|_| { send_msg("++++++ this is another test message", "127.0.0.1:6666"); }, time::Duration::from_secs(7));
+
         let socket2 =  mio::net::UdpSocket::bind("127.0.0.1:7777".parse().unwrap()).unwrap();
-
         my_events.e_attach_fd(socket2, mio::Interest::READABLE, receive_msg2, Priority::HighPriority).unwrap();
-        my_events.e_queue(|| { send_msg("====== this is a test message", "127.0.0.1:7777"); }, time::Duration::from_secs(2));
-        my_events.e_queue(|| { send_msg("====== this is another test message", "127.0.0.1:7777"); }, time::Duration::from_secs(7));
+        my_events.e_queue(|_| { send_msg("====== this is a test message", "127.0.0.1:7777"); }, time::Duration::from_secs(2));
+        my_events.e_queue(|_| { send_msg("====== this is another test message", "127.0.0.1:7777"); }, time::Duration::from_secs(7));
 
-        let ev_clone = my_events.clone();
-        let result = my_events.e_queue(move || { ev_clone.e_exit_events(); }, time::Duration::from_secs(21));
+        let result = my_events.e_queue(exit_events, time::Duration::from_secs(21));
         assert_eq!(result, 0);
 
 
