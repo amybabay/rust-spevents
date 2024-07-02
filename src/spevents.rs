@@ -11,7 +11,7 @@ const DEFAULT_EVENTS_CAPACITY: usize = 1024;
 const MAX_MSG_SIZE: usize = 1024;
 
 struct TimedEvent {
-    callback: fn(&SpEvents),
+    callback: fn(&mut SpEvents),
     register_instant: time::Instant,
     delta_time: time::Duration,
 }
@@ -48,10 +48,10 @@ pub enum Priority {
 }
 
 pub struct SpEvents {
-    poll: RefCell<mio::Poll>,
-    fd_events: RefCell<vec::Vec<Box<dyn AnyFdEvent>>>,
+    poll: mio::Poll,
+    fd_events: vec::Vec<Box<dyn AnyFdEvent>>,
     timed_events: RefCell<vec::Vec<TimedEvent>>,
-    exit_events: RefCell<bool>, // true if we should exit on next loop; false otherwise
+    exit_events: bool, // true if we should exit on next loop; false otherwise
 }
 
 impl SpEvents {
@@ -63,15 +63,15 @@ impl SpEvents {
         };
 
         // Build SpEvents struct with empty data structures
-        Ok(SpEvents {poll: RefCell::new(poll),
-                     fd_events: RefCell::new(vec::Vec::new()),
+        Ok(SpEvents {poll: poll,
+                     fd_events: vec::Vec::new(),
                      timed_events: RefCell::new(vec::Vec::new()),
-                     exit_events: RefCell::new(false)
+                     exit_events: false
                     })
     }
 
     /// Schedules callback function `func` to be called after time `delta_time` elapses
-    pub fn e_queue(&self, func: fn(&SpEvents), delta_time: time::Duration) -> i32 {
+    pub fn e_queue(&self, func: fn(&mut SpEvents), delta_time: time::Duration) -> i32 {
         println!("Queueing event: delta time {:?}", delta_time);
         let event = TimedEvent {callback: func, 
                                 register_instant: time::Instant::now(),
@@ -82,17 +82,16 @@ impl SpEvents {
 
     /// Attaches callback function `func` to mio event source `source`, such that `func` is called
     /// each time mio interest `interest` (e.g. readable, writeable) is ready
-    pub fn e_attach_fd<S>(&self, mut source: S, interest: mio::Interest, func: fn(&S, &SpEvents), priority: Priority) -> io::Result<()>
+    pub fn e_attach_fd<S>(&mut self, mut source: S, interest: mio::Interest, func: fn(&S, &SpEvents), priority: Priority) -> io::Result<()>
     where S: mio::event::Source + 'static,
     {
-        let mut fd_events = self.fd_events.borrow_mut();
-        let event_count = fd_events.len();
+        let event_count = self.fd_events.len();
         if event_count == DEFAULT_EVENTS_CAPACITY {
             return Err(io::Error::new(io::ErrorKind::Other, "Maximum number of FD events already registered"))
         }
 
         let token = mio::Token(event_count);
-        if let Err(err) = self.poll.borrow_mut().registry().register(&mut source, token, interest) {
+        if let Err(err) = self.poll.registry().register(&mut source, token, interest) {
             return Err(err)
         }
 
@@ -100,13 +99,13 @@ impl SpEvents {
                              source: Box::new(source),
                              token: token};
 
-        fd_events.push(Box::new(event));
+        self.fd_events.push(Box::new(event));
         Ok(())
     }
 
     /// Set `self.exit_events` to true, so that we will exit the event loop on the next iteration
-    pub fn e_exit_events(&self) {
-        *self.exit_events.borrow_mut() = true;
+    pub fn e_exit_events(&mut self) {
+        self.exit_events = true;
     }
 
     fn get_ready_events(&self) -> vec::Vec<TimedEvent> {
@@ -144,10 +143,10 @@ impl SpEvents {
         Some(min_timeout)
     }
 
-    fn get_fd_event_by_token<'a>(&'a self, fd_events: &'a mut vec::Vec::<Box<dyn AnyFdEvent>>, token: mio::Token) -> Option<&mut dyn AnyFdEvent> {
-        for event in fd_events.iter_mut() {
+    fn get_fd_event_by_token(&self, token: mio::Token) -> Option<&dyn AnyFdEvent> {
+        for event in self.fd_events.iter() {
             if event.get_token() == token {
-                return Some(&mut **event)
+                return Some(& **event)
             }
         }
         None
@@ -156,7 +155,7 @@ impl SpEvents {
     /// Start the event loop. Normally this is called after scheduling some timed events and/or
     /// attaching some fd events. This will run until `e_exit_events` is called (if no scheduled /
     /// attached event ever calls `e_exit_events`, the loop will run forever)
-    pub fn e_handle_events(&self) {
+    pub fn e_handle_events(&mut self) {
         let mut mio_events = mio::Events::with_capacity(DEFAULT_EVENTS_CAPACITY);
 
         loop {
@@ -164,17 +163,17 @@ impl SpEvents {
             let mut ready_events = self.get_ready_events();
             for event in ready_events.iter_mut() {
                 println!("Doing event: register_instant.elapsed {:?}, delta time {:?}", event.register_instant.elapsed(), event.delta_time);
-                (event.callback)(&self);
+                (event.callback)(self);
 
                 // Check whether we should exit
-                if *self.exit_events.borrow() {
+                if self.exit_events {
                     return;
                 }
             }
 
             // Poll to check if we have events waiting for us.
             let timeout = self.get_next_timeout();
-            if let Err(err) = self.poll.borrow_mut().poll(&mut mio_events, timeout) {
+            if let Err(err) = self.poll.poll(&mut mio_events, timeout) {
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
@@ -184,15 +183,14 @@ impl SpEvents {
             // Process all ready fd events. Note that spurious wakeups are possible, and that we are
             // required to read until we get a WouldBlock error; otherwise, we are not guaranteed to be
             // notified the next time there is data ready to read.
-            let mut fd_events = self.fd_events.borrow_mut();
             for event in mio_events.iter() {
-                let event_data = self.get_fd_event_by_token(&mut fd_events, event.token());
+                let event_data = self.get_fd_event_by_token(event.token());
                 if let Some(ev) = event_data {
-                    ev.do_callback(&self);
+                    ev.do_callback(self);
                 }
 
                 // Check whether we should exit
-                if *self.exit_events.borrow() {
+                if self.exit_events {
                     return;
                 }
             } // end event iteration
@@ -209,12 +207,12 @@ pub fn add(left: usize, right: usize) -> usize {
     left + right
 }
 
-pub fn say_hello(events: &SpEvents) {
+pub fn say_hello(events: &mut SpEvents) {
     println!("hello");
     events.e_queue(say_hello, time::Duration::from_millis(5000));
 }
 
-pub fn exit_events(events: &SpEvents) {
+pub fn exit_events(events: &mut SpEvents) {
     events.e_exit_events();
 }
 
@@ -274,7 +272,7 @@ mod tests {
 
     #[test]
     fn e_timed() {
-        let my_events = SpEvents::new().unwrap();
+        let mut my_events = SpEvents::new().unwrap();
 
         let result = my_events.e_queue(|_| { add(3, 4); }, time::Duration::from_millis(500));
         assert_eq!(result, 0);
@@ -290,7 +288,7 @@ mod tests {
 
     #[test]
     fn e_fd_minimal() {
-        let my_events = SpEvents::new().unwrap();
+        let mut my_events = SpEvents::new().unwrap();
         let socket =  mio::net::UdpSocket::bind("127.0.0.1:5555".parse().unwrap()).unwrap();
 
         my_events.e_attach_fd(socket, mio::Interest::READABLE, |_,_| { add(2, 5); }, Priority::HighPriority).unwrap();
@@ -306,7 +304,7 @@ mod tests {
 
     #[test]
     fn e_fd() {
-        let my_events = SpEvents::new().unwrap();
+        let mut my_events = SpEvents::new().unwrap();
 
         let socket =  mio::net::UdpSocket::bind("127.0.0.1:6666".parse().unwrap()).unwrap();
         my_events.e_attach_fd(socket, mio::Interest::READABLE, receive_msg, Priority::HighPriority).unwrap();
