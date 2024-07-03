@@ -18,6 +18,7 @@ struct TimedEvent {
 trait AnyFdEvent {
     fn do_callback(&self, events: &mut SpEvents);
     fn get_token(&self) -> mio::Token;
+    fn get_source(&mut self) -> &mut dyn mio::event::Source;
 }
 
 struct FdEvent<S>
@@ -36,6 +37,10 @@ impl <S: mio::event::Source + ?Sized> AnyFdEvent for FdEvent<S> {
     fn get_token(&self) -> mio::Token {
         self.token
     }
+
+    fn get_source(&mut self) -> &mut dyn mio::event::Source {
+        &mut self.source
+    }
 }
 
 pub enum Priority {
@@ -49,6 +54,7 @@ pub struct SpEvents {
     fd_events: vec::Vec<Box<dyn AnyFdEvent>>,
     timed_events: vec::Vec<TimedEvent>,
     exit_events: bool, // true if we should exit on next loop; false otherwise
+    next_token: usize, // next token to use when registering an FD event
 }
 
 impl SpEvents {
@@ -63,7 +69,8 @@ impl SpEvents {
         Ok(SpEvents {poll: poll,
                      fd_events: vec::Vec::new(),
                      timed_events: vec::Vec::new(),
-                     exit_events: false
+                     exit_events: false,
+                     next_token: 0
                     })
     }
 
@@ -77,6 +84,25 @@ impl SpEvents {
         0
     }
 
+    /// Un-schedules callback function `func`
+    pub fn e_dequeue(&mut self, func: fn(&mut SpEvents)) -> i32 {
+        let mut i = 0;
+        let te = &mut self.timed_events;
+
+        while i < te.len() {
+            let event = &te[i];
+            if event.callback == func {
+                te.swap_remove(i);
+                println!("Dequeued event: {:?}", func);
+                return 0 // should we enforce that there is only one registered instance of a particular function?
+            } else {
+                i += 1;
+            }
+        }
+        println!("e_dequeue event not found: {:?}", func);
+        -1
+    }
+
     /// Attaches callback function `func` to mio event source `source`, such that `func` is called
     /// each time mio interest `interest` (e.g. readable, writeable) is ready
     pub fn e_attach_fd<S>(&mut self, mut source: S, interest: mio::Interest, func: fn(&S, &mut SpEvents), priority: Priority) -> io::Result<()>
@@ -87,10 +113,11 @@ impl SpEvents {
             return Err(io::Error::new(io::ErrorKind::Other, "Maximum number of FD events already registered"))
         }
 
-        let token = mio::Token(event_count);
+        let token = mio::Token(self.next_token);
         if let Err(err) = self.poll.registry().register(&mut source, token, interest) {
             return Err(err)
         }
+        self.next_token += 1;
 
         let event = FdEvent {callback: func,
                              source: Box::new(source),
@@ -98,6 +125,18 @@ impl SpEvents {
 
         self.fd_events.push(Box::new(event));
         Ok(())
+    }
+
+    /* Should this be based on token (which we don't currently return from e_attach) or on the
+     * source itself? */
+    /// Detaches callback previously registered with mio Token `token`
+    pub fn e_detach_fd(&mut self, token: mio::Token) -> i32
+    {
+        if let Some(mut ev) = self.get_fd_event_by_token(token) {
+            self.poll.registry().deregister(ev.get_source());
+            return 0
+        }
+        return -1
     }
 
     /// Set `self.exit_events` to true, so that we will exit the event loop on the next iteration
@@ -171,6 +210,7 @@ impl SpEvents {
     /// attached event ever calls `e_exit_events`, the loop will run forever)
     pub fn e_handle_events(&mut self) {
         let mut mio_events = mio::Events::with_capacity(DEFAULT_EVENTS_CAPACITY);
+        self.exit_events = false; // enables calling e_handle_events again after exiting the event loop
 
         loop {
             // Handle timed events
@@ -302,10 +342,35 @@ mod tests {
         let result = my_events.e_queue(|_| { add(3, 4); }, time::Duration::from_millis(500));
         assert_eq!(result, 0);
 
-        let result = my_events.e_queue(say_hello, time::Duration::from_millis(5000));
+        let result = my_events.e_queue(say_hello, time::Duration::from_secs(5));
         assert_eq!(result, 0);
 
-        let result = my_events.e_queue(exit_events, time::Duration::from_millis(20000));
+        let result = my_events.e_queue(say_hello, time::Duration::from_secs(3));
+        assert_eq!(result, 0);
+
+        let result = my_events.e_queue(exit_events, time::Duration::from_secs(20));
+        assert_eq!(result, 0);
+
+        let result = my_events.e_dequeue(say_hello);
+        assert_eq!(result, 0);
+
+        /*
+        loop {
+            let result = my_events.e_dequeue(say_hello);
+            if result < 0 {
+                break;
+            }
+        }
+        */
+
+        my_events.e_handle_events();
+
+        println!("\nReturned from e_handle_events!!");
+
+        let result = my_events.e_queue(|_| { add(3333, 4444); }, time::Duration::from_millis(500));
+        assert_eq!(result, 0);
+
+        let result = my_events.e_queue(exit_events, time::Duration::from_secs(2));
         assert_eq!(result, 0);
 
         my_events.e_handle_events();
